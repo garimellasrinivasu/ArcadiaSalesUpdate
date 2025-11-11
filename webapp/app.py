@@ -1,0 +1,1338 @@
+import os
+from datetime import datetime
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, send_file
+from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
+from io import StringIO, BytesIO
+import requests
+from dotenv import load_dotenv
+import re
+import csv
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.normpath(os.path.join(BASE_DIR, '..', 'arcadia_sales.db'))
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+
+# Load env vars from .env files
+load_dotenv()  # current working directory
+try:
+    # Also load from project root (parent of webapp)
+    load_dotenv(os.path.normpath(os.path.join(BASE_DIR, '..', '.env')))
+except Exception:
+    pass
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('APP_SECRET', 'dev-secret-key')
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = scoped_session(sessionmaker(bind=engine))
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    username = Column(String(50), unique=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(20), nullable=False)  # 'CRM' or 'ADMIN'
+
+Base.metadata.create_all(engine)
+
+def seed_users():
+    db = SessionLocal()
+    try:
+        # Create users table if not exists
+        if not engine.dialect.has_table(engine.connect(), 'users'):
+            Base.metadata.tables['users'].create(bind=engine)
+        # Seed defaults
+        def ensure_user(username, password, role):
+            u = db.query(User).filter_by(username=username).first()
+            if not u:
+                u = User(username=username, password_hash=generate_password_hash(password, method='pbkdf2:sha256'), role=role)
+                db.add(u)
+        ensure_user('vasu', 'kaka', 'CRM')
+        ensure_user('admin', 'admin', 'ADMIN')
+        db.commit()
+    finally:
+        db.close()
+
+seed_users()
+
+# Option tables for dynamic select values
+def ensure_option_tables():
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS spg_options (value TEXT PRIMARY KEY)")
+        cur.execute("CREATE TABLE IF NOT EXISTS sale_type_options (value TEXT PRIMARY KEY)")
+        # Sales people table
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sales_people (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                full_name TEXT NOT NULL,
+                phone TEXT,
+                email TEXT,
+                address TEXT,
+                title TEXT CHECK(title IN ('Junior Sales Person','Senior Sales Person')),
+                photo_path TEXT,
+                owner_username TEXT
+            )
+            """
+        )
+        # Seed defaults if empty
+        cur.execute("SELECT COUNT(*) FROM spg_options");
+        if cur.fetchone()[0] == 0:
+            cur.executemany("INSERT INTO spg_options(value) VALUES (?)", [("SPG",),("Praneeth",)])
+        cur.execute("SELECT COUNT(*) FROM sale_type_options");
+        if cur.fetchone()[0] == 0:
+            cur.executemany("INSERT INTO sale_type_options(value) VALUES (?)", [("OTP",),("R",)])
+        conn.commit()
+    finally:
+        conn.close()
+
+ensure_option_tables()
+
+# Helpers
+
+def current_user():
+    if 'user_id' in session:
+        db = SessionLocal()
+        try:
+            return db.query(User).get(session['user_id'])
+        finally:
+            db.close()
+    return None
+
+def login_required(role=None):
+    def decorator(fn):
+        def wrapper(*args, **kwargs):
+            user = current_user()
+            if not user:
+                return redirect(url_for('login', next=request.path))
+            if role and user.role != role:
+                flash('Unauthorized', 'error')
+                return redirect(url_for('index'))
+            return fn(*args, **kwargs)
+        wrapper.__name__ = fn.__name__
+        return wrapper
+    return decorator
+
+def get_options(table):
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT value FROM {table} ORDER BY value")
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+def get_sales_people_names():
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT full_name FROM sales_people ORDER BY full_name")
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+def is_valid_option(table, value):
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT 1 FROM {table} WHERE value = ?", (value,))
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+def clean_number(val):
+    return float(re.sub(r"[^0-9.-]", "", (val or '0'))) if re.sub(r"[^0-9.-]", "", (val or '')) != '' else 0.0
+
+def format_currency_csv(n):
+    try:
+        x = float(n or 0)
+    except Exception:
+        x = 0.0
+    # Use ASCII dollar to avoid encoding issues across viewers
+    return f"$ {x:,.2f}"
+
+def compute_totals(base, prem, sbua, received, tos):
+    # Total Sale Price = SBUA * Base Sq Ft Price (exclude amenities/premiums from total)
+    total = (base or 0) * (sbua or 0)
+    received = received or 0
+    balance = total - received
+    tos = (tos or '').upper()
+    if tos == 'OTP':
+        by_plan = balance
+        during_exec = 0.0
+    else:
+        # For non-OTP (e.g., 'R'): collect 25% by plan approval, remainder during execution
+        by_plan = max((total * 0.25) - received, 0.0)
+        during_exec = max(balance - by_plan, 0.0)
+    return total, balance, by_plan, during_exec
+
+# Payments table
+def ensure_payments_table():
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sale_rowid INTEGER NOT NULL,
+                paid_date DATE NOT NULL,
+                amount REAL NOT NULL,
+                note TEXT
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+ensure_payments_table()
+
+@app.route('/')
+def index():
+    user = current_user()
+    if not user:
+        return redirect(url_for('login'))
+    if user.role == 'ADMIN':
+        return redirect(url_for('admin_dashboard'))
+    return redirect(url_for('crm_new'))
+
+@app.route('/login', methods=['GET','POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username','').strip()
+        password = request.form.get('password','')
+        db = SessionLocal()
+        try:
+            user = db.query(User).filter_by(username=username).first()
+            if user and check_password_hash(user.password_hash, password):
+                session['user_id'] = user.id
+                session['role'] = user.role
+                if user.role == 'ADMIN':
+                    return redirect(url_for('admin_dashboard'))
+                return redirect(url_for('crm_new'))
+            flash('Invalid credentials', 'error')
+        finally:
+            db.close()
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+# CRM Routes
+@app.route('/crm/new', methods=['GET','POST'])
+@login_required(role='CRM')
+def crm_new():
+    user = current_user()
+    if request.method == 'POST':
+        data = dict(request.form)
+        errors = []
+        spg = data.get('spg_praneeth','').strip() or 'SPG'
+        tos = (data.get('type_of_sale','').strip() or 'OTP').upper()
+        if not is_valid_option('spg_options', spg):
+            errors.append('spg_praneeth invalid')
+        if not is_valid_option('sale_type_options', tos):
+            errors.append('type_of_sale invalid')
+        base = clean_number(data.get('base_sqft_price'))
+        prem = clean_number(data.get('amenties_and_premiums'))
+        land = clean_number(data.get('land_sqyards'))
+        sbua = land * 13.5
+        amt_received = clean_number(data.get('amount_received'))
+        total_sale_price, balance_amount, by_plan, during_exec = compute_totals(base, prem, sbua, amt_received, tos)
+        if errors:
+            return jsonify({"ok": False, "errors": errors})
+        # Get next s_no and insert
+        conn = engine.raw_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COALESCE(MAX(s_no), 0) + 1 FROM sale_details")
+            next_sno = cur.fetchone()[0]
+            cur.execute(
+                """
+                INSERT INTO sale_details (
+                    s_no, booking_date, project, spg_praneeth, token, buyer_name, sol, type_of_sale,
+                    land_sqyards, sbua_sqft, facing, base_sqft_price, amenties_and_premiums,
+                    total_sale_price, amount_received, balance_amount,
+                    balance_tobe_received_by_plan_approval, notes, balance_tobe_received_during_exec,
+                    sale_person_name, crm_name
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(next_sno),
+                    data.get('booking_date') or None,
+                    data.get('project'),
+                    spg,
+                    int(data.get('token') or 0) or None,
+                    data.get('buyer_name'),
+                    data.get('sol'),
+                    tos,
+                    int(land) if land else None,
+                    float(sbua) if sbua else None,
+                    data.get('facing'),
+                    float(base) if base else None,
+                    float(prem) if prem else None,
+                    float(total_sale_price),
+                    float(amt_received) if amt_received else None,
+                    float(balance_amount),
+                    float(by_plan),
+                    data.get('notes'),
+                    float(during_exec),
+                    data.get('sale_person_name'),
+                    user.username
+                )
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return jsonify({"ok": True, "s_no": int(next_sno)})
+    # GET: load options and next s_no
+    conn = engine.raw_connection()
+    spg_opts, tos_opts, next_sno = [], [], 1
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM spg_options ORDER BY value"); spg_opts = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT value FROM sale_type_options ORDER BY value"); tos_opts = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT COALESCE(MAX(s_no), 0) + 1 FROM sale_details"); next_sno = cur.fetchone()[0]
+    finally:
+        conn.close()
+    today = datetime.today().strftime('%Y-%m-%d')
+    sale_people = get_sales_people_names()
+    return render_template('crm_new.html', user=user, spg_opts=spg_opts, tos_opts=tos_opts, next_sno=next_sno, today=today, sale_people=sale_people)
+
+@app.route('/crm/list')
+@login_required(role='CRM')
+def crm_list():
+    user = current_user()
+    sort_by = request.args.get('sort_by','booking_date')
+    sort_dir = request.args.get('sort_dir','desc').lower()
+    allowed = {
+        's_no':'s_no', 'booking_date':'booking_date', 'buyer_name':'buyer_name', 'sale_person_name':'sale_person_name',
+        'total_sale_price':'total_sale_price', 'amount_received':'amount_received', 'balance_amount':'balance_amount',
+        'balance_tobe_received_by_plan_approval':'balance_tobe_received_by_plan_approval', 'balance_tobe_received_during_exec':'balance_tobe_received_during_exec'
+    }
+    col = allowed.get(sort_by, 'booking_date')
+    dir_sql = 'DESC' if sort_dir == 'desc' else 'ASC'
+    # keep NULL dates last when sorting by date desc
+    if col == 'booking_date' and dir_sql == 'DESC':
+        order_clause = "(booking_date IS NULL) ASC, booking_date DESC, s_no DESC"
+    else:
+        order_clause = f"{col} {dir_sql}"
+    conn = engine.raw_connection()
+    rows = []
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT rowid, * FROM sale_details WHERE crm_name = ? ORDER BY {order_clause}", (user.username,))
+        cols = [d[0] for d in cur.description]
+        for r in cur.fetchall():
+            rec = dict(zip(cols, r))
+            # Compute effective amount received = initial amount + sum(payments)
+            try:
+                rid = rec.get('rowid')
+                cur.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE sale_rowid = ?", (rid,))
+                pay_sum = cur.fetchone()[0] or 0
+            except Exception:
+                pay_sum = 0
+            try:
+                base_received = float(rec.get('amount_received') or 0)
+            except Exception:
+                base_received = 0.0
+            rec['amount_received_effective'] = base_received + (pay_sum or 0)
+            # Compute effective balance = total - effective received
+            try:
+                total = float(rec.get('total_sale_price') or 0)
+            except Exception:
+                total = 0.0
+            rec['balance_amount_effective'] = total - rec['amount_received_effective']
+            rows.append(rec)
+    finally:
+        conn.close()
+    return render_template('crm_list.html', rows=rows, user=user, sort_by=col, sort_dir=dir_sql.lower())
+
+@app.route('/crm/export')
+@login_required(role='CRM')
+def crm_export():
+    user = current_user()
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        # Same columns/order as Admin dashboard export but filtered to current CRM
+        query = (
+            "SELECT "
+            "s_no, booking_date, project, spg_praneeth, token, buyer_name, sale_person_name, crm_name, sol, "
+            "type_of_sale, land_sqyards, sbua_sqft, facing, base_sqft_price, amenties_and_premiums, "
+            "total_sale_price, amount_received, balance_amount, balance_tobe_received_by_plan_approval, notes, "
+            "balance_tobe_received_during_exec "
+            "FROM sale_details WHERE crm_name = ? ORDER BY (booking_date IS NULL) ASC, booking_date DESC, s_no DESC"
+        )
+        cur.execute(query, (user.username,))
+        rows = cur.fetchall()
+        text = StringIO()
+        writer = csv.writer(text)
+        writer.writerow([
+            'S.No','Booking Date','Project','SPG/Praneeth','Token','Buyer Name','Sale Person Name','CRM Name','SOL',
+            'Type of Sale','Land (sq yards)','SBUA (sq feet)','Facing','Base sq ft price','Amenities and Premiums',
+            'Total Sale Price','Amount Received','Balance Amount','Balance to be received by plan approval','Notes',
+            'Balance to be received during execution'
+        ])
+        for r in rows:
+            r = list(r)
+            # currency fields by index in SELECT: 13,14,15,16,17,18,20
+            for idx in (13,14,15,16,17,18,20):
+                r[idx] = format_currency_csv(r[idx])
+            writer.writerow(r)
+        data = text.getvalue().encode('utf-8')
+        bio = BytesIO(data)
+        bio.seek(0)
+        uname = (user.username if user else 'user')
+        ts = datetime.today().strftime('%Y%m%d-%H%M%S')
+        return send_file(bio, mimetype='text/csv', as_attachment=True, download_name=f'{uname}_my_sales_{ts}.csv')
+    finally:
+        conn.close()
+
+@app.route('/crm/edit/<int:rowid>', methods=['GET','POST'])
+@login_required(role='CRM')
+def crm_edit(rowid):
+    user = current_user()
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        if request.method == 'POST':
+            data = dict(request.form)
+            # Only allow editable non-calculated fields
+            allowed = ['booking_date','project','spg_praneeth','token','buyer_name','sol','type_of_sale',
+                       'land_sqyards','sbua_sqft','facing','base_sqft_price','amenties_and_premiums',
+                       'amount_received','notes','sale_person_name']
+            sets = []
+            vals = []
+            for k in allowed:
+                if k in data:
+                    sets.append(f"{k}=?")
+                    vals.append(data[k])
+            # Recompute calculated fields (updated formula)
+            base = clean_number(data.get('base_sqft_price'))
+            prem = clean_number(data.get('amenties_and_premiums'))
+            land = clean_number(data.get('land_sqyards'))
+            sbua = land * 13.5
+            amt_received = clean_number(data.get('amount_received'))
+            tos = (data.get('type_of_sale') or '').upper()
+            total_sale_price, balance_amount, by_plan, during_exec = compute_totals(base, prem, sbua, amt_received, tos)
+            sets += ["sbua_sqft=?","total_sale_price=?","balance_amount=?","balance_tobe_received_by_plan_approval=?","balance_tobe_received_during_exec=?"]
+            vals += [sbua, total_sale_price, balance_amount, by_plan, during_exec]
+            # Enforce ownership
+            vals.append(user.username)
+            vals.append(rowid)
+            sql = f"UPDATE sale_details SET {', '.join(sets)} WHERE crm_name = ? AND rowid = ?"
+            cur.execute(sql, tuple(vals))
+            conn.commit()
+            return redirect(url_for('crm_list'))
+        else:
+            cur.execute("SELECT rowid, * FROM sale_details WHERE crm_name = ? AND rowid = ?", (user.username, rowid))
+            row = cur.fetchone()
+            if not row:
+                flash('Not found or unauthorized', 'error')
+                return redirect(url_for('crm_list'))
+            cols = [d[0] for d in cur.description]
+            rec = dict(zip(cols, row))
+            # payments
+            cur.execute("SELECT paid_date, amount, note FROM payments WHERE sale_rowid = ? ORDER BY paid_date DESC, id DESC", (rowid,))
+            payments = cur.fetchall()
+            cur.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE sale_rowid = ?", (rowid,))
+            pay_total = cur.fetchone()[0] or 0
+            # Show initial Amount Received as part of history (display only)
+            try:
+                init_amt = float(rec.get('amount_received') or 0)
+            except Exception:
+                init_amt = 0.0
+            if init_amt > 0:
+                payments = [(rec.get('booking_date'), init_amt, 'Initial Amount Received')] + payments
+            sale_people = get_sales_people_names()
+            return render_template('crm_edit.html', row=rec, user=user, payments=payments, payments_total=pay_total, sale_people=sale_people)
+    finally:
+        conn.close()
+
+@app.route('/crm/delete/<int:rowid>', methods=['POST'])
+@login_required(role='CRM')
+def crm_delete(rowid):
+    user = current_user()
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM sale_details WHERE rowid = ? AND crm_name = ?", (rowid, user.username))
+        conn.commit()
+        flash('Entry deleted', 'success')
+    finally:
+        conn.close()
+    return redirect(url_for('crm_list'))
+
+# Admin routes
+@app.route('/admin/dashboard')
+@login_required(role='ADMIN')
+def admin_dashboard():
+    # Filters
+    month = request.args.get('month')
+    year = request.args.get('year') or datetime.today().strftime('%Y')
+    crm = request.args.get('crm_name')
+    sp = request.args.get('sale_person_name')
+    spg = request.args.get('spg_praneeth')
+    tos = request.args.get('type_of_sale')
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        # Options for dropdowns
+        cur.execute("SELECT DISTINCT crm_name FROM sale_details WHERE crm_name IS NOT NULL ORDER BY crm_name")
+        crm_opts = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT DISTINCT sale_person_name FROM sale_details WHERE sale_person_name IS NOT NULL ORDER BY sale_person_name")
+        sp_opts = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT value FROM spg_options ORDER BY value")
+        spg_opts = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT value FROM sale_type_options ORDER BY value")
+        tos_opts = [r[0] for r in cur.fetchall()]
+
+        # Detailed rows with all required columns for dashboard order
+        query = (
+            "SELECT rowid, "
+            "s_no, booking_date, project, spg_praneeth, token, buyer_name, sale_person_name, crm_name, sol, "
+            "type_of_sale, land_sqyards, sbua_sqft, facing, base_sqft_price, amenties_and_premiums, "
+            "total_sale_price, amount_received, balance_amount, balance_tobe_received_by_plan_approval, notes, "
+            "balance_tobe_received_during_exec "
+            "FROM sale_details WHERE 1=1"
+        )
+        params = []
+        if year:
+            query += " AND strftime('%Y', booking_date) = ?"; params.append(year)
+        if month:
+            query += " AND strftime('%m', booking_date) = ?"; params.append(month.zfill(2))
+        if crm:
+            query += " AND crm_name = ?"; params.append(crm)
+        if sp:
+            query += " AND sale_person_name = ?"; params.append(sp)
+        if spg:
+            query += " AND spg_praneeth = ?"; params.append(spg)
+        if tos:
+            query += " AND type_of_sale = ?"; params.append(tos)
+        # Sorting
+        sort_by = request.args.get('sort_by','booking_date')
+        sort_dir = request.args.get('sort_dir','desc').lower()
+        allowed = {
+            's_no':'s_no','booking_date':'booking_date','project':'project','spg_praneeth':'spg_praneeth','token':'token',
+            'buyer_name':'buyer_name','sale_person_name':'sale_person_name','crm_name':'crm_name','sol':'sol','type_of_sale':'type_of_sale',
+            'land_sqyards':'land_sqyards','sbua_sqft':'sbua_sqft','facing':'facing','base_sqft_price':'base_sqft_price',
+            'amenties_and_premiums':'amenties_and_premiums','total_sale_price':'total_sale_price','amount_received':'amount_received',
+            'balance_amount':'balance_amount','balance_tobe_received_by_plan_approval':'balance_tobe_received_by_plan_approval',
+            'notes':'notes','balance_tobe_received_during_exec':'balance_tobe_received_during_exec'
+        }
+        col = allowed.get(sort_by, 'booking_date')
+        dir_sql = 'DESC' if sort_dir == 'desc' else 'ASC'
+        if col == 'booking_date' and dir_sql == 'DESC':
+            query += " ORDER BY (booking_date IS NULL) ASC, booking_date DESC, s_no DESC"
+        else:
+            query += f" ORDER BY {col} {dir_sql}"
+        # limit rows: default 10, allow 25 or 50
+        try:
+            limit = int(request.args.get('limit') or 10)
+        except:
+            limit = 10
+        if limit not in (10,25,50):
+            limit = 10
+        query += " LIMIT ?"
+        params.append(limit)
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        data = []
+        for r in rows:
+            rec = dict(zip(cols, r))
+            # Compute effective amount received = initial amount + sum(payments)
+            try:
+                rid = rec.get('rowid')
+                cur.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE sale_rowid = ?", (rid,))
+                pay_sum = cur.fetchone()[0] or 0
+            except Exception:
+                pay_sum = 0
+            try:
+                base_received = float(rec.get('amount_received') or 0)
+            except Exception:
+                base_received = 0.0
+            rec['amount_received_effective'] = base_received + (pay_sum or 0)
+            data.append(rec)
+        # Year options: current, current-1, current-2
+        cur_year = int(datetime.today().strftime('%Y'))
+        years = [str(cur_year - i) for i in range(0,3)]
+        return render_template('admin_dashboard.html', data=data, filters={'year':year,'month':month,'crm':crm,'sp':sp,'spg':spg,'tos':tos},
+                               crm_opts=crm_opts, sp_opts=sp_opts, spg_opts=spg_opts, tos_opts=tos_opts, years=years, limit=limit,
+                               sort_by=col, sort_dir=dir_sql.lower())
+    finally:
+        conn.close()
+
+def build_admin_filtered_rows(month, year, crm, sp, spg, tos):
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        query = (
+            "SELECT "
+            "s_no, booking_date, project, spg_praneeth, token, buyer_name, sale_person_name, crm_name, sol, "
+            "type_of_sale, land_sqyards, sbua_sqft, facing, base_sqft_price, amenties_and_premiums, "
+            "total_sale_price, amount_received, balance_amount, balance_tobe_received_by_plan_approval, notes, "
+            "balance_tobe_received_during_exec "
+            "FROM sale_details WHERE 1=1"
+        )
+        params = []
+        if year:
+            query += " AND strftime('%Y', booking_date) = ?"; params.append(year)
+        if month:
+            query += " AND strftime('%m', booking_date) = ?"; params.append(month.zfill(2))
+        if crm:
+            query += " AND crm_name = ?"; params.append(crm)
+        if sp:
+            query += " AND sale_person_name = ?"; params.append(sp)
+        if spg:
+            query += " AND spg_praneeth = ?"; params.append(spg)
+        if tos:
+            query += " AND type_of_sale = ?"; params.append(tos)
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+        return rows
+    finally:
+        conn.close()
+
+def generate_dashboard_xlsx(month, year, crm, sp, spg, tos):
+    import pandas as pd
+    rows = build_admin_filtered_rows(month, year, crm, sp, spg, tos)
+    headers = [
+        'S.No','Booking Date','Project','SPG/Praneeth','Token','Buyer Name','Sale Person Name','CRM Name','SOL',
+        'Type of Sale','Land (sq yards)','SBUA (sq feet)','Facing','Base sq ft price','Amenities and Premiums',
+        'Total Sale Price','Amount Received','Balance Amount','Balance to be received by plan approval','Notes',
+        'Balance to be received during execution'
+    ]
+    df = pd.DataFrame(list(rows), columns=headers)
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Dashboard')
+    bio.seek(0)
+    return bio
+
+@app.route('/admin/export_xlsx')
+@login_required(role='ADMIN')
+def admin_export_xlsx():
+    month = request.args.get('month')
+    year = request.args.get('year')
+    crm = request.args.get('crm_name')
+    sp = request.args.get('sale_person_name')
+    spg = request.args.get('spg_praneeth')
+    tos = request.args.get('type_of_sale')
+    bio = generate_dashboard_xlsx(month, year, crm, sp, spg, tos)
+    ts = datetime.today().strftime('%Y%m%d-%H%M%S')
+    return send_file(bio, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name=f'admin_dashboard_{ts}.xlsx')
+
+@app.route('/admin/send_whatsapp', methods=['POST'])
+@login_required(role='ADMIN')
+def admin_send_whatsapp():
+    to_number_raw = (request.form.get('to_number') or '').strip()
+    # Sanitize to E.164 numeric string without spaces or dashes; remove leading '+' for API
+    to_number = re.sub(r"[^0-9]", "", to_number_raw)
+    month = request.form.get('month')
+    year = request.form.get('year')
+    crm = request.form.get('crm_name')
+    sp = request.form.get('sale_person_name')
+    spg = request.form.get('spg_praneeth')
+    tos = request.form.get('type_of_sale')
+    if not to_number:
+        flash('Provide a WhatsApp number (with country code).', 'error')
+        return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+    token = os.environ.get('WHATSAPP_TOKEN')
+    phone_id = os.environ.get('WHATSAPP_PHONE_NUMBER_ID')
+    if not token or not phone_id:
+        flash('WhatsApp credentials missing. Set WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID.', 'error')
+        return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+    bio = generate_dashboard_xlsx(month, year, crm, sp, spg, tos)
+    ts = datetime.today().strftime('%Y%m%d-%H%M%S')
+    filename = f'dashboard_{ts}.xlsx'
+    try:
+        upload_url = f'https://graph.facebook.com/v20.0/{phone_id}/media'
+        headers = { 'Authorization': f'Bearer {token}' }
+        files = { 'file': (filename, bio, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') }
+        data = { 'messaging_product': 'whatsapp', 'type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }
+        up_res = requests.post(upload_url, headers=headers, data=data, files=files, timeout=30)
+        if not up_res.ok:
+            try:
+                err_txt = up_res.text
+            except Exception:
+                err_txt = ''
+            flash(f"Failed to upload media to WhatsApp (HTTP {up_res.status_code}). {err_txt[:300]}", 'error')
+            return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+        media_id = (up_res.json() or {}).get('id')
+        if not media_id:
+            flash('Invalid media upload response.', 'error')
+            return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+        msg_url = f'https://graph.facebook.com/v20.0/{phone_id}/messages'
+        payload = {
+            'messaging_product': 'whatsapp',
+            'to': to_number,
+            'type': 'document',
+            'document': { 'id': media_id, 'filename': filename }
+        }
+        msg_res = requests.post(msg_url, headers={**headers, 'Content-Type': 'application/json'}, json=payload, timeout=30)
+        if not msg_res.ok:
+            try:
+                err_txt = msg_res.text
+            except Exception:
+                err_txt = ''
+            flash(f"Failed to send WhatsApp message (HTTP {msg_res.status_code}). {err_txt[:300]}", 'error')
+            return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+        flash('Dashboard Excel sent via WhatsApp.', 'success')
+    except Exception:
+        flash('Error sending WhatsApp message.', 'error')
+    return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+
+# Debug route: send a plain text WhatsApp message to verify credentials and recipient status
+@app.route('/admin/send_whatsapp_text', methods=['POST'])
+@login_required(role='ADMIN')
+def admin_send_whatsapp_text():
+    to_number_raw = (request.form.get('to_number') or '').strip()
+    message = (request.form.get('message') or 'Test message from Arcadia Sales').strip()
+    month = request.form.get('month')
+    year = request.form.get('year')
+    crm = request.form.get('crm_name')
+    sp = request.form.get('sale_person_name')
+    spg = request.form.get('spg_praneeth')
+    tos = request.form.get('type_of_sale')
+    to_number = re.sub(r"[^0-9]", "", to_number_raw)
+    if not to_number:
+        flash('Provide a WhatsApp number (with country code).', 'error')
+        return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+    token = os.environ.get('WHATSAPP_TOKEN')
+    phone_id = os.environ.get('WHATSAPP_PHONE_NUMBER_ID')
+    if not token or not phone_id:
+        flash('WhatsApp credentials missing. Set WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID.', 'error')
+        return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+    try:
+        msg_url = f'https://graph.facebook.com/v20.0/{phone_id}/messages'
+        headers = { 'Authorization': f'Bearer {token}', 'Content-Type': 'application/json' }
+        payload = {
+            'messaging_product': 'whatsapp',
+            'to': to_number,
+            'type': 'text',
+            'text': { 'body': message }
+        }
+        res = requests.post(msg_url, headers=headers, json=payload, timeout=30)
+        if not res.ok:
+            try:
+                err_txt = res.text
+            except Exception:
+                err_txt = ''
+            flash(f"Failed to send test text (HTTP {res.status_code}). {err_txt[:300]}", 'error')
+            return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+        flash('Test text sent via WhatsApp.', 'success')
+    except Exception:
+        flash('Error sending WhatsApp test text.', 'error')
+    return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+
+@app.route('/admin/export')
+@login_required(role='ADMIN')
+def admin_export():
+    # Export current filtered dashboard data as CSV
+    month = request.args.get('month')
+    year = request.args.get('year')
+    crm = request.args.get('crm_name')
+    sp = request.args.get('sale_person_name')
+    spg = request.args.get('spg_praneeth')
+    tos = request.args.get('type_of_sale')
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        # Use same column set and order as the dashboard table
+        query = (
+            "SELECT "
+            "s_no, booking_date, project, spg_praneeth, token, buyer_name, sale_person_name, crm_name, sol, "
+            "type_of_sale, land_sqyards, sbua_sqft, facing, base_sqft_price, amenties_and_premiums, "
+            "total_sale_price, amount_received, balance_amount, balance_tobe_received_by_plan_approval, notes, "
+            "balance_tobe_received_during_exec "
+            "FROM sale_details WHERE 1=1"
+        )
+        params = []
+        if year:
+            query += " AND strftime('%Y', booking_date) = ?"; params.append(year)
+        if month:
+            query += " AND strftime('%m', booking_date) = ?"; params.append(month.zfill(2))
+        if crm:
+            query += " AND crm_name = ?"; params.append(crm)
+        if sp:
+            query += " AND sale_person_name = ?"; params.append(sp)
+        if spg:
+            query += " AND spg_praneeth = ?"; params.append(spg)
+        if tos:
+            query += " AND type_of_sale = ?"; params.append(tos)
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+        text = StringIO()
+        writer = csv.writer(text)
+        writer.writerow([
+            'S.No','Booking Date','Project','SPG/Praneeth','Token','Buyer Name','Sale Person Name','CRM Name','SOL',
+            'Type of Sale','Land (sq yards)','SBUA (sq feet)','Facing','Base sq ft price','Amenities and Premiums',
+            'Total Sale Price','Amount Received','Balance Amount','Balance to be received by plan approval','Notes',
+            'Balance to be received during execution'
+        ])
+        for r in rows:
+            r = list(r)
+            # currency fields by index in SELECT: 13,14,15,16,17,18,20
+            for idx in (13,14,15,16,17,18,20):
+                r[idx] = format_currency_csv(r[idx])
+            writer.writerow(r)
+        data = text.getvalue().encode('utf-8')
+        bio = BytesIO(data)
+        bio.seek(0)
+        user = current_user()
+        uname = (user.username if user else 'admin')
+        ts = datetime.today().strftime('%Y%m%d-%H%M%S')
+        return send_file(bio, mimetype='text/csv', as_attachment=True, download_name=f'{uname}_dashboard_{ts}.csv')
+    finally:
+        conn.close()
+
+@app.route('/admin/crms')
+@login_required(role='ADMIN')
+def admin_crms():
+    db = SessionLocal()
+    try:
+        users = db.query(User).order_by(User.username).all()
+        return render_template('admin_crms.html', users=users)
+    finally:
+        db.close()
+
+@app.route('/admin/crms/new', methods=['POST'])
+@login_required(role='ADMIN')
+def admin_crms_new():
+    username = request.form.get('username','').strip()
+    password = request.form.get('password','').strip()
+    role = request.form.get('role','CRM')
+    if not username or not password or role not in ('CRM','ADMIN'):
+        flash('Provide username, password, and valid role', 'error')
+        return redirect(url_for('admin_crms'))
+    db = SessionLocal()
+    try:
+        if db.query(User).filter_by(username=username).first():
+            flash('Username already exists', 'error')
+        else:
+            db.add(User(username=username, password_hash=generate_password_hash(password, method='pbkdf2:sha256'), role=role))
+            db.commit()
+            flash('User created', 'success')
+    finally:
+        db.close()
+    return redirect(url_for('admin_crms'))
+
+@app.route('/admin/crms/<int:uid>/edit', methods=['POST'])
+@login_required(role='ADMIN')
+def admin_crms_edit(uid):
+    password = request.form.get('password','').strip()
+    role = request.form.get('role','CRM')
+    db = SessionLocal()
+    try:
+        u = db.get(User, uid)
+        if not u:
+            flash('User not found', 'error')
+        else:
+            if password:
+                u.password_hash = generate_password_hash(password, method='pbkdf2:sha256')
+            u.role = role if role in ('CRM','ADMIN') else u.role
+            db.commit()
+            flash('User updated', 'success')
+    finally:
+        db.close()
+    return redirect(url_for('admin_crms'))
+
+@app.route('/admin/crms/<int:uid>/delete', methods=['POST'])
+@login_required(role='ADMIN')
+def admin_crms_delete(uid):
+    db = SessionLocal()
+    try:
+        u = db.get(User, uid)
+        if not u:
+            flash('User not found', 'error')
+        else:
+            db.delete(u)
+            db.commit()
+            flash('User deleted', 'success')
+    finally:
+        db.close()
+    return redirect(url_for('admin_crms'))
+
+# Admin can create new sale entries (won't be editable by CRMs)
+@app.route('/admin/new', methods=['GET','POST'])
+@login_required(role='ADMIN')
+def admin_new():
+    user = current_user()
+    if request.method == 'POST':
+        data = dict(request.form)
+        errors = []
+        spg = (data.get('spg_praneeth','').strip() or 'SPG')
+        tos = (data.get('type_of_sale','').strip() or 'OTP').upper()
+        if not is_valid_option('spg_options', spg):
+            errors.append('spg_praneeth invalid')
+        if not is_valid_option('sale_type_options', tos):
+            errors.append('type_of_sale invalid')
+        base = clean_number(data.get('base_sqft_price'))
+        prem = clean_number(data.get('amenties_and_premiums'))
+        sbua = clean_number(data.get('sbua_sqft'))
+        land = clean_number(data.get('land_sqyards'))
+        amt_received = clean_number(data.get('amount_received'))
+        # Note: use SBUA for total calculation
+        total_sale_price, balance_amount, by_plan, during_exec = compute_totals(base, prem, sbua, amt_received, tos)
+        if errors:
+            flash('; '.join(errors), 'error')
+            return redirect(url_for('admin_new'))
+        conn = engine.raw_connection()
+        try:
+            cur = conn.cursor()
+            # next s_no
+            cur.execute("SELECT COALESCE(MAX(s_no), 0) + 1 FROM sale_details")
+            next_sno = cur.fetchone()[0]
+            cur.execute(
+                """
+                INSERT INTO sale_details (
+                    s_no, booking_date, project, spg_praneeth, token, buyer_name, sol, type_of_sale,
+                    land_sqyards, sbua_sqft, facing, base_sqft_price, amenties_and_premiums,
+                    total_sale_price, amount_received, balance_amount,
+                    balance_tobe_received_by_plan_approval, notes, balance_tobe_received_during_exec,
+                    sale_person_name, crm_name
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(next_sno),
+                    data.get('booking_date') or None,
+                    data.get('project'),
+                    spg,
+                    int(data.get('token') or 0) or None,
+                    data.get('buyer_name'),
+                    data.get('sol'),
+                    tos,
+                    int(land) if land else None,
+                    float(sbua) if sbua else None,
+                    data.get('facing'),
+                    float(base) if base else None,
+                    float(prem) if prem else None,
+                    float(total_sale_price),
+                    float(amt_received) if amt_received else None,
+                    float(balance_amount),
+                    float(by_plan),
+                    data.get('notes'),
+                    float(data.get('balance_tobe_received_during_exec') or 0) or None,
+                    data.get('sale_person_name'),
+                    user.username
+                )
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        # If AJAX request, return JSON so frontend can append s_no and redirect
+        if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
+            return jsonify({"ok": True, "s_no": int(next_sno)})
+        flash('Sale created', 'success')
+        return redirect(url_for('admin_new', saved=1, s_no=int(next_sno)))
+    # GET: provide options, next s_no, and today
+    conn = engine.raw_connection()
+    spg_opts, tos_opts, next_sno = [], [], 1
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM spg_options ORDER BY value"); spg_opts = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT value FROM sale_type_options ORDER BY value"); tos_opts = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT COALESCE(MAX(s_no), 0) + 1 FROM sale_details"); next_sno = cur.fetchone()[0]
+    finally:
+        conn.close()
+    today = datetime.today().strftime('%Y-%m-%d')
+    sale_people = get_sales_people_names()
+    return render_template('admin_new.html', spg_opts=spg_opts, tos_opts=tos_opts, next_sno=next_sno, today=today, sale_people=sale_people)
+
+# Admin: My Entries list (only entries created by this admin)
+@app.route('/admin/entries')
+@login_required(role='ADMIN')
+def admin_entries():
+    user = current_user()
+    sort_by = request.args.get('sort_by','booking_date')
+    sort_dir = request.args.get('sort_dir','desc').lower()
+    allowed = {
+        's_no':'s_no','booking_date':'booking_date','buyer_name':'buyer_name','sale_person_name':'sale_person_name',
+        'total_sale_price':'total_sale_price','amount_received':'amount_received','balance_amount':'balance_amount',
+        'balance_tobe_received_by_plan_approval':'balance_tobe_received_by_plan_approval','balance_tobe_received_during_exec':'balance_tobe_received_during_exec'
+    }
+    col = allowed.get(sort_by, 'booking_date')
+    dir_sql = 'DESC' if sort_dir == 'desc' else 'ASC'
+    if col == 'booking_date' and dir_sql == 'DESC':
+        order_clause = "(booking_date IS NULL) ASC, booking_date DESC, s_no DESC"
+    else:
+        order_clause = f"{col} {dir_sql}"
+    conn = engine.raw_connection()
+    rows = []
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT rowid, * FROM sale_details WHERE crm_name = ? ORDER BY {order_clause}", (user.username,))
+        cols = [d[0] for d in cur.description]
+        for r in cur.fetchall():
+            rec = dict(zip(cols, r))
+            # Compute effective amount received = initial amount + sum(payments)
+            try:
+                rid = rec.get('rowid')
+                cur.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE sale_rowid = ?", (rid,))
+                pay_sum = cur.fetchone()[0] or 0
+            except Exception:
+                pay_sum = 0
+            try:
+                base_received = float(rec.get('amount_received') or 0)
+            except Exception:
+                base_received = 0.0
+            rec['amount_received_effective'] = base_received + (pay_sum or 0)
+            # Compute effective balance = total - effective received
+            try:
+                total = float(rec.get('total_sale_price') or 0)
+            except Exception:
+                total = 0.0
+            rec['balance_amount_effective'] = total - rec['amount_received_effective']
+            rows.append(rec)
+    finally:
+        conn.close()
+    return render_template('admin_list.html', rows=rows, user=user, sort_by=col, sort_dir=dir_sql.lower())
+
+# Admin: Sale detail view
+@app.route('/admin/sales/<int:rowid>')
+@login_required(role='ADMIN')
+def admin_sale_detail(rowid):
+    user = current_user()
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT rowid, * FROM sale_details WHERE rowid = ?", (rowid,))
+        row = cur.fetchone()
+        if not row:
+            flash('Not found', 'error')
+            return redirect(url_for('admin_dashboard'))
+        cols = [d[0] for d in cur.description]
+        rec = dict(zip(cols, row))
+        cur.execute("SELECT paid_date, amount, note FROM payments WHERE sale_rowid = ? ORDER BY paid_date DESC, id DESC", (rowid,))
+        payments = cur.fetchall()
+        # Sum of payments to compute effective received
+        cur.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE sale_rowid = ?", (rowid,))
+        pay_sum = cur.fetchone()[0] or 0
+        try:
+            base_received = float(rec.get('amount_received') or 0)
+        except Exception:
+            base_received = 0.0
+        amount_received_effective = base_received + (pay_sum or 0)
+        # Prepend initial Amount Received as part of history (display only)
+        try:
+            init_amt = float(rec.get('amount_received') or 0)
+        except Exception:
+            init_amt = 0.0
+        if init_amt > 0:
+            payments = [(rec.get('booking_date'), init_amt, 'Initial Amount Received')] + payments
+        return render_template('admin_sale_detail.html', row=rec, payments=payments, amount_received_effective=amount_received_effective)
+    finally:
+        conn.close()
+
+# CRM: Manage Sales People
+@app.route('/crm/sales_people')
+@login_required(role='CRM')
+def crm_sales_people():
+    user = current_user()
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, full_name, phone, email, address, title FROM sales_people WHERE owner_username = ? ORDER BY full_name", (user.username,))
+        people = cur.fetchall()
+        return render_template('crm_sales_people.html', people=people)
+    finally:
+        conn.close()
+
+@app.route('/crm/sales_people/new', methods=['GET','POST'])
+@login_required(role='CRM')
+def crm_sales_people_new():
+    user = current_user()
+    if request.method == 'POST':
+        full_name = request.form.get('full_name','').strip()
+        phone = request.form.get('phone')
+        email = request.form.get('email')
+        address = request.form.get('address')
+        title = request.form.get('title')
+        photo = request.files.get('photo')
+        photo_path = None
+        if photo and photo.filename:
+            uploads = os.path.join(BASE_DIR, 'uploads')
+            os.makedirs(uploads, exist_ok=True)
+            fname = f"{int(datetime.now().timestamp())}_{photo.filename}"
+            fpath = os.path.join(uploads, fname)
+            photo.save(fpath)
+            photo_path = fpath
+        conn = engine.raw_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO sales_people(full_name, phone, email, address, title, photo_path, owner_username) VALUES(?,?,?,?,?,?,?)",
+                        (full_name, phone, email, address, title, photo_path, user.username))
+            conn.commit()
+            flash('Sales person added','success')
+        finally:
+            conn.close()
+        return redirect(url_for('crm_sales_people'))
+    return render_template('crm_sales_people_form.html', person=None)
+
+@app.route('/crm/sales_people/<int:pid>/edit', methods=['GET','POST'])
+@login_required(role='CRM')
+def crm_sales_people_edit(pid):
+    user = current_user()
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        if request.method == 'POST':
+            full_name = request.form.get('full_name','').strip()
+            phone = request.form.get('phone')
+            email = request.form.get('email')
+            address = request.form.get('address')
+            title = request.form.get('title')
+            photo = request.files.get('photo')
+            photo_path = None
+            if photo and photo.filename:
+                uploads = os.path.join(BASE_DIR, 'uploads')
+                os.makedirs(uploads, exist_ok=True)
+                fname = f"{int(datetime.now().timestamp())}_{photo.filename}"
+                fpath = os.path.join(uploads, fname)
+                photo.save(fpath)
+                photo_path = fpath
+            sets = ["full_name=?","phone=?","email=?","address=?","title=?"]
+            vals = [full_name, phone, email, address, title]
+            if photo_path:
+                sets.append("photo_path=?")
+                vals.append(photo_path)
+            vals += [user.username, pid]
+            cur.execute(f"UPDATE sales_people SET {', '.join(sets)} WHERE owner_username = ? AND id = ?", tuple(vals))
+            conn.commit()
+            flash('Sales person updated','success')
+            return redirect(url_for('crm_sales_people'))
+        else:
+            cur.execute("SELECT id, full_name, phone, email, address, title, photo_path FROM sales_people WHERE owner_username = ? AND id = ?", (user.username, pid))
+            row = cur.fetchone()
+            if not row:
+                flash('Not found','error')
+                return redirect(url_for('crm_sales_people'))
+            cols = [d[0] for d in cur.description]
+            person = dict(zip(cols, row))
+            return render_template('crm_sales_people_form.html', person=person)
+    finally:
+        conn.close()
+
+@app.route('/crm/sales_people/<int:pid>/delete', methods=['POST'])
+@login_required(role='CRM')
+def crm_sales_people_delete(pid):
+    user = current_user()
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM sales_people WHERE owner_username = ? AND id = ?", (user.username, pid))
+        conn.commit()
+        flash('Sales person deleted','success')
+    finally:
+        conn.close()
+    return redirect(url_for('crm_sales_people'))
+
+# Admin: Edit own entry
+@app.route('/admin/edit/<int:rowid>', methods=['GET','POST'])
+@login_required(role='ADMIN')
+def admin_edit(rowid):
+    user = current_user()
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        if request.method == 'POST':
+            data = dict(request.form)
+            allowed = ['booking_date','project','spg_praneeth','token','buyer_name','sol','type_of_sale',
+                       'land_sqyards','sbua_sqft','facing','base_sqft_price','amenties_and_premiums',
+                       'amount_received','notes','sale_person_name']
+            sets = []
+            vals = []
+            for k in allowed:
+                if k in data:
+                    sets.append(f"{k}=?")
+                    vals.append(data[k])
+            def cleanf(x):
+                return float(re.sub(r"[^0-9.-]", "", x or '0') or 0)
+            base = cleanf(data.get('base_sqft_price'))
+            prem = cleanf(data.get('amenties_and_premiums'))
+            land = cleanf(data.get('land_sqyards'))
+            sbua = land * 13.5
+            amt_received = cleanf(data.get('amount_received'))
+            tos = (data.get('type_of_sale') or '').upper()
+            total_sale_price, balance_amount, by_plan, during_exec = compute_totals(base, prem, sbua, amt_received, tos)
+            sets += ["sbua_sqft= ?","total_sale_price= ?","balance_amount= ?","balance_tobe_received_by_plan_approval= ?","balance_tobe_received_during_exec= ?"]
+            vals += [sbua, total_sale_price, balance_amount, by_plan, during_exec]
+            vals.append(user.username)
+            vals.append(rowid)
+            sql = f"UPDATE sale_details SET {', '.join(sets)} WHERE crm_name = ? AND rowid = ?"
+            cur.execute(sql, tuple(vals))
+            conn.commit()
+            return redirect(url_for('admin_entries'))
+        else:
+            cur.execute("SELECT rowid, * FROM sale_details WHERE crm_name = ? AND rowid = ?", (user.username, rowid))
+            row = cur.fetchone()
+            if not row:
+                flash('Not found or unauthorized', 'error')
+                return redirect(url_for('admin_entries'))
+            cols = [d[0] for d in cur.description]
+            rec = dict(zip(cols, row))
+            # payments
+            cur.execute("SELECT paid_date, amount, note FROM payments WHERE sale_rowid = ? ORDER BY paid_date DESC, id DESC", (rowid,))
+            payments = cur.fetchall()
+            cur.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE sale_rowid = ?", (rowid,))
+            pay_total = cur.fetchone()[0] or 0
+            # Show initial Amount Received as part of history (display only)
+            try:
+                init_amt = float(rec.get('amount_received') or 0)
+            except Exception:
+                init_amt = 0.0
+            if init_amt > 0:
+                payments = [(rec.get('booking_date'), init_amt, 'Initial Amount Received')] + payments
+            return render_template('crm_edit.html', row=rec, user=user, payments=payments, payments_total=pay_total)
+    finally:
+        conn.close()
+
+# Add payment (CRM)
+@app.route('/crm/edit/<int:rowid>/add_payment', methods=['POST'])
+@login_required(role='CRM')
+def crm_add_payment(rowid):
+    user = current_user()
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        # Ownership check
+        cur.execute("SELECT total_sale_price, amount_received, type_of_sale FROM sale_details WHERE rowid = ? AND crm_name = ?", (rowid, user.username))
+        row = cur.fetchone()
+        if not row:
+            flash('Not found or unauthorized', 'error')
+            return redirect(url_for('crm_list'))
+        total_sale_price, amount_received, tos = row[0] or 0, row[1] or 0, (row[2] or '').upper()
+        paid_date = request.form.get('paid_date') or datetime.now().strftime('%Y-%m-%dT%H:%M')
+        amount = request.form.get('amount') or '0'
+        note = request.form.get('note')
+        try:
+            amt = float(re.sub(r"[^0-9.-]", "", amount) or 0)
+        except:
+            amt = 0
+        if amt <= 0:
+            flash('Amount must be positive', 'error')
+            return redirect(url_for('crm_edit', rowid=rowid))
+        cur.execute("INSERT INTO payments(sale_rowid, paid_date, amount, note) VALUES(?,?,?,?)", (rowid, paid_date, amt, note))
+        # recompute balances using amount_received + sum(payments)
+        cur.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE sale_rowid = ?", (rowid,))
+        pay_sum = cur.fetchone()[0] or 0
+        effective_received = (amount_received or 0) + pay_sum
+        balance = (total_sale_price or 0) - effective_received
+        if tos == 'OTP':
+            by_plan = balance
+            during_exec = 0.0
+        else:
+            by_plan = max((total_sale_price or 0) * 0.25 - effective_received, 0.0)
+            during_exec = max(balance - by_plan, 0.0)
+        cur.execute("UPDATE sale_details SET balance_amount = ?, balance_tobe_received_by_plan_approval = ?, balance_tobe_received_during_exec = ? WHERE rowid = ?", (balance, by_plan, during_exec, rowid))
+        conn.commit()
+        flash('Payment added', 'success')
+        return redirect(url_for('crm_edit', rowid=rowid))
+    finally:
+        conn.close()
+
+# Add payment (Admin)
+@app.route('/admin/edit/<int:rowid>/add_payment', methods=['POST'])
+@login_required(role='ADMIN')
+def admin_add_payment(rowid):
+    user = current_user()
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT total_sale_price, amount_received, type_of_sale FROM sale_details WHERE rowid = ? AND crm_name = ?", (rowid, user.username))
+        row = cur.fetchone()
+        if not row:
+            flash('Not found or unauthorized', 'error')
+            return redirect(url_for('admin_entries'))
+        total_sale_price, amount_received, tos = row[0] or 0, row[1] or 0, (row[2] or '').upper()
+        paid_date = request.form.get('paid_date') or datetime.now().strftime('%Y-%m-%dT%H:%M')
+        amount = request.form.get('amount') or '0'
+        note = request.form.get('note')
+        try:
+            amt = float(re.sub(r"[^0-9.-]", "", amount) or 0)
+        except:
+            amt = 0
+        if amt <= 0:
+            flash('Amount must be positive', 'error')
+            return redirect(url_for('admin_edit', rowid=rowid))
+        cur.execute("INSERT INTO payments(sale_rowid, paid_date, amount, note) VALUES(?,?,?,?)", (rowid, paid_date, amt, note))
+        cur.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE sale_rowid = ?", (rowid,))
+        pay_sum = cur.fetchone()[0] or 0
+        effective_received = (amount_received or 0) + pay_sum
+        balance = (total_sale_price or 0) - effective_received
+        if tos == 'OTP':
+            by_plan = balance
+            during_exec = 0.0
+        else:
+            by_plan = max((total_sale_price or 0) * 0.25 - effective_received, 0.0)
+            during_exec = max(balance - by_plan, 0.0)
+        cur.execute("UPDATE sale_details SET balance_amount = ?, balance_tobe_received_by_plan_approval = ?, balance_tobe_received_during_exec = ? WHERE rowid = ?", (balance, by_plan, during_exec, rowid))
+        conn.commit()
+        flash('Payment added', 'success')
+        return redirect(url_for('admin_edit', rowid=rowid))
+    finally:
+        conn.close()
+
+# Admin: Delete own entry
+@app.route('/admin/delete/<int:rowid>', methods=['POST'])
+@login_required(role='ADMIN')
+def admin_delete(rowid):
+    user = current_user()
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM sale_details WHERE rowid = ? AND crm_name = ?", (rowid, user.username))
+        conn.commit()
+        flash('Entry deleted', 'success')
+    finally:
+        conn.close()
+    return redirect(url_for('admin_entries'))
+
+@app.route('/admin/options', methods=['GET','POST'])
+@login_required(role='ADMIN')
+def admin_options():
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        if request.method == 'POST':
+            kind = request.form.get('kind')
+            val = (request.form.get('value') or '').strip()
+            action = request.form.get('action')
+            table = 'spg_options' if kind == 'spg' else 'sale_type_options'
+            if action == 'add' and val:
+                try:
+                    cur.execute(f"INSERT INTO {table}(value) VALUES (?)", (val,))
+                    conn.commit()
+                    flash('Option added', 'success')
+                except Exception:
+                    flash('Option exists or invalid', 'error')
+            elif action == 'delete' and val:
+                cur.execute(f"DELETE FROM {table} WHERE value = ?", (val,))
+                conn.commit()
+                flash('Option deleted', 'success')
+        cur.execute("SELECT value FROM spg_options ORDER BY value"); spg = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT value FROM sale_type_options ORDER BY value"); tos = [r[0] for r in cur.fetchall()]
+        return render_template('admin_options.html', spg=spg, tos=tos)
+    finally:
+        conn.close()
+
+# Static helper route for field rules (shown as tooltips/help)
+@app.route('/field-rules')
+def field_rules():
+    return jsonify({
+        'spg_praneeth': 'Allowed values: SPG or Praneeth',
+        'type_of_sale': 'Allowed values: OTP or R',
+        'calculated': 'Calculated: total_sale_price, balance_amount, balance_tobe_received_by_plan_approval',
+    })
+
+if __name__ == '__main__':
+    app.run(debug=True)

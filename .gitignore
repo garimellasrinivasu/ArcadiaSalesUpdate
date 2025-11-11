@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.dist-info/
+venv/
+.venv/
+env/
+ENV/
+.build/
+build/
+dist/
+
+# OS/Editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Flask/Runtime
+instance/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Node (if any tooling is added later)
+node_modules/
+
+# Environment
+.env
+*.env

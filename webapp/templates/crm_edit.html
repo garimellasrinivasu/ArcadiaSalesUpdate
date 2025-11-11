@@ -1,0 +1,173 @@
+{% extends 'base.html' %}
+{% block title %}Edit Entry{% endblock %}
+{% block content %}
+<h1>Edit Entry</h1>
+<form id="crmEditForm" method="post" class="card form">
+  <div class="form-row">
+    <label class="inline">S. No: {{ row.s_no }}</label>
+    <label>Booking Date
+      <input name="booking_date" type="date" value="{{ row.booking_date }}" data-prev="{{ row.booking_date }}">
+      <small class="prev"></small>
+    </label>
+    <label>Project
+      <input name="project" type="text" value="{{ row.project }}" data-prev="{{ row.project }}">
+      <small class="prev"></small>
+    </label>
+  </div>
+  <div class="form-row">
+    <label>SPG/Praneeth
+      <select name="spg_praneeth" required data-prev="{{ row.spg_praneeth }}">
+        <option value="SPG" {{ 'selected' if row.spg_praneeth=='SPG' }}>SPG</option>
+        <option value="Praneeth" {{ 'selected' if row.spg_praneeth=='Praneeth' }}>Praneeth</option>
+      </select>
+      <small class="prev"></small>
+    </label>
+    <label>Type of Sale
+      <select name="type_of_sale" required data-prev="{{ row.type_of_sale }}">
+        <option value="OTP" {{ 'selected' if row.type_of_sale=='OTP' }}>OTP</option>
+        <option value="R" {{ 'selected' if row.type_of_sale=='R' }}>R</option>
+      </select>
+      <small class="prev"></small>
+    </label>
+    <label>Token
+      <input name="token" type="number" step="1" value="{{ row.token }}" data-prev="{{ row.token }}">
+      <small class="prev"></small>
+    </label>
+  </div>
+  <div class="form-row">
+    <label>Buyer Name
+      <input name="buyer_name" type="text" value="{{ row.buyer_name }}" data-prev="{{ row.buyer_name }}">
+      <small class="prev"></small>
+    </label>
+    <label>SOL
+      <input name="sol" type="text" value="{{ row.sol }}" data-prev="{{ row.sol }}">
+      <small class="prev"></small>
+    </label>
+    <label>Facing
+      <select name="facing" data-prev="{{ row.facing }}">
+        {% set facing_opts = ['North','South','East','West','North-East','South-East','North-West','South-West'] %}
+        {% for f in facing_opts %}
+          <option value="{{ f }}" {{ 'selected' if row.facing==f }}>{{ f }}</option>
+        {% endfor %}
+      </select>
+      <small class="prev"></small>
+    </label>
+  </div>
+  <div class="form-row">
+    <label>Land (sq yards)
+      <input name="land_sqyards" type="text" inputmode="decimal" value="{{ row.land_sqyards }}" data-prev="{{ row.land_sqyards }}">
+      <small class="prev"></small>
+    </label>
+    <label>SBUA (sqft)
+      <span id="sbua_display">{{ row.sbua_sqft }}</span>
+      <input type="hidden" name="sbua_sqft" value="{{ row.sbua_sqft }}" data-prev="{{ row.sbua_sqft }}">
+      <small class="prev"></small>
+    </label>
+    <label>Base sqft price
+      <input name="base_sqft_price" type="text" inputmode="decimal" value="{{ row.base_sqft_price }}" data-prev="{{ row.base_sqft_price }}">
+      <small class="prev"></small>
+    </label>
+    <label>Amenities & Premiums
+      <input name="amenties_and_premiums" type="text" inputmode="decimal" value="{{ row.amenties_and_premiums }}" data-prev="{{ row.amenties_and_premiums }}">
+      <small class="prev"></small>
+    </label>
+    <label>Amount Received
+      <input name="amount_received" type="text" inputmode="decimal" value="{{ row.amount_received }}" data-prev="{{ row.amount_received }}">
+      <small class="prev"></small>
+    </label>
+    <label>Sale Person Name
+      <select name="sale_person_name" data-prev="{{ row.sale_person_name }}">
+        <option value="">Select</option>
+        {% for sp in sale_people %}
+          <option value="{{ sp }}" {{ 'selected' if row.sale_person_name==sp }}>{{ sp }}</option>
+        {% endfor %}
+      </select>
+      <small class="prev"></small>
+    </label>
+  </div>
+  <label class="wide">Notes
+    <textarea name="notes" rows="5" data-prev="{{ row.notes }}">{{ row.notes }}</textarea>
+    <small class="prev"></small>
+  </label>
+
+  <div class="calculated">
+    <div>
+      <span>Total Sale Price</span>
+      <strong id="edit_total_sale_price">₹ 0.00</strong>
+    </div>
+    <div>
+      <span>Balance Amount</span>
+      <strong id="edit_balance_amount">₹ 0.00</strong>
+    </div>
+    <div>
+      <span>Balance by Plan Approval</span>
+      <strong id="edit_balance_plan">₹ 0.00</strong>
+    </div>
+  </div>
+
+</form>
+
+<div class="grid-two" style="margin-top:12px">
+  <section class="card">
+    <h3>Payment History</h3>
+    <p>Total Additional Paid: <strong id="payments_total" class="currency" data-value="{{ payments_total or 0 }}">{{ payments_total or 0 }}</strong></p>
+    <div class="table-scroll">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Date & Time</th>
+            <th>Amount</th>
+            <th>Note</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for p in payments %}
+          <tr>
+            <td>{{ (p[0] or '')|replace('T',' ') }}</td>
+            <td><span class="currency" data-value="{{ p[1] or 0 }}">{{ p[1] or 0 }}</span></td>
+            <td>{{ p[2] or '' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <section class="card">
+    <h3>Add Payment</h3>
+    <form method="post" action="{% if user.role=='ADMIN' %}{{ url_for('admin_add_payment', rowid=row.rowid) }}{% else %}{{ url_for('crm_add_payment', rowid=row.rowid) }}{% endif %}" class="form">
+      <div class="form-row">
+        <label class="required"><span class="label-text">Paid Date & Time</span>
+          <input type="datetime-local" name="paid_date" required>
+        </label>
+        <label class="required"><span class="label-text">Amount</span>
+          <input type="text" name="amount" inputmode="decimal" placeholder="₹ 0.00" required>
+        </label>
+        <label>Note
+          <input type="text" name="note">
+        </label>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button type="submit" class="btn">Add Payment</button>
+        <button type="button" class="btn secondary" onclick="history.back()">Cancel</button>
+      </div>
+    </form>
+    <p class="help">Adding a payment will reduce Balance and Balance by Plan automatically.</p>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+initEditForm();
+// Disable all inputs/selects/textareas and the Save button in the main edit form
+document.addEventListener('DOMContentLoaded', function() {
+  const form = document.getElementById('crmEditForm');
+  if (form) {
+    form.querySelectorAll('input, select, textarea').forEach(function(el){
+      el.disabled = true;
+    });
+    const saveBtn = form.querySelector('button[type="submit"]');
+    if (saveBtn) saveBtn.disabled = true;
+  }
+});
+</script>
+{% endblock %}
