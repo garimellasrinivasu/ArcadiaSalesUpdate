@@ -70,7 +70,9 @@
       <a class="btn secondary" href="{{ url_for('admin_dashboard') }}">Clear</a>
     </div>
   </div>
-  <div class="row">
+</form>
+<div class="card">
+  <div class="inline-form">
     <form method="post" action="{{ url_for('admin_send_whatsapp') }}" class="inline-form">
       <input type="hidden" name="year" value="{{ filters.year or '' }}">
       <input type="hidden" name="month" value="{{ filters.month or '' }}">
@@ -79,11 +81,11 @@
       <input type="hidden" name="spg_praneeth" value="{{ filters.spg or '' }}">
       <input type="hidden" name="type_of_sale" value="{{ filters.tos or '' }}">
       <label>WhatsApp Number
-        <input type="text" name="to_number" placeholder="e.g. +919642516666" value="">
+        <input type="text" name="to_number" placeholder="e.g. 15551234567" value="">
       </label>
       <button class="btn" type="submit">Send XLSX via WhatsApp</button>
     </form>
-    <form method="post" action="{{ url_for('admin_send_whatsapp_text') }}" class="inline-form" style="margin-left: 1rem;">
+    <form method="post" action="{{ url_for('admin_send_whatsapp_text') }}" class="inline-form">
       <input type="hidden" name="year" value="{{ filters.year or '' }}">
       <input type="hidden" name="month" value="{{ filters.month or '' }}">
       <input type="hidden" name="crm_name" value="{{ filters.crm or '' }}">
@@ -91,13 +93,13 @@
       <input type="hidden" name="spg_praneeth" value="{{ filters.spg or '' }}">
       <input type="hidden" name="type_of_sale" value="{{ filters.tos or '' }}">
       <label>Test Text to WhatsApp
-        <input type="text" name="to_number" placeholder="e.g. +919642516666" value="">
+        <input type="text" name="to_number" placeholder="e.g. 15551234567" value="">
       </label>
-      <input type="text" name="message" placeholder="Message" value="Test message from Arcadia Sales">
+      <input type="text" name="message" placeholder="Message or template:hello_world[:en_US]" value="Test message from Arcadia Sales">
       <button class="btn secondary" type="submit">Send Test Text</button>
     </form>
   </div>
-</form>
+</div>
 
 <div class="table-scroll">
 <table class="table">

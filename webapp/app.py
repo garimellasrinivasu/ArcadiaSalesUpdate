@@ -38,6 +38,62 @@ class User(Base):
 
 Base.metadata.create_all(engine)
 
+def init_sqlite_schema():
+    conn = engine.raw_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sale_details (
+                s_no INTEGER,
+                booking_date DATE,
+                project TEXT,
+                spg_praneeth TEXT,
+                token INTEGER,
+                buyer_name TEXT,
+                sol TEXT,
+                type_of_sale TEXT,
+                land_sqyards INTEGER,
+                sbua_sqft REAL,
+                facing TEXT,
+                base_sqft_price REAL,
+                amenties_and_premiums REAL,
+                total_sale_price REAL,
+                amount_received REAL,
+                balance_amount REAL,
+                balance_tobe_received_by_plan_approval REAL,
+                notes TEXT,
+                balance_tobe_received_during_exec REAL,
+                sale_person_name TEXT,
+                crm_name TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payments (
+                sale_rowid INTEGER,
+                paid_date TEXT,
+                amount REAL,
+                note TEXT
+            )
+            """
+        )
+        cur.execute("CREATE TABLE IF NOT EXISTS spg_options (value TEXT PRIMARY KEY)")
+        cur.execute("CREATE TABLE IF NOT EXISTS sale_type_options (value TEXT PRIMARY KEY)")
+        cur.execute("CREATE TABLE IF NOT EXISTS sales_people (full_name TEXT PRIMARY KEY)")
+        cur.execute("SELECT COUNT(*) FROM spg_options")
+        if (cur.fetchone() or [0])[0] == 0:
+            cur.executemany("INSERT INTO spg_options(value) VALUES (?)", [("SPG",), ("Praneeth",)])
+        cur.execute("SELECT COUNT(*) FROM sale_type_options")
+        if (cur.fetchone() or [0])[0] == 0:
+            cur.executemany("INSERT INTO sale_type_options(value) VALUES (?)", [("OTP",), ("R",)])
+        conn.commit()
+    finally:
+        conn.close()
+
+init_sqlite_schema()
+
 def seed_users():
     db = SessionLocal()
     try:
@@ -679,14 +735,32 @@ def admin_send_whatsapp():
             'document': { 'id': media_id, 'filename': filename }
         }
         msg_res = requests.post(msg_url, headers={**headers, 'Content-Type': 'application/json'}, json=payload, timeout=30)
-        if not msg_res.ok:
+        try:
             try:
-                err_txt = msg_res.text
+                body = msg_res.json() or {}
             except Exception:
-                err_txt = ''
-            flash(f"Failed to send WhatsApp message (HTTP {msg_res.status_code}). {err_txt[:300]}", 'error')
-            return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
-        flash('Dashboard Excel sent via WhatsApp.', 'success')
+                body = {}
+            if not msg_res.ok:
+                try:
+                    err_txt = msg_res.text
+                except Exception:
+                    err_txt = ''
+                flash(f"Failed to send WhatsApp message (HTTP {msg_res.status_code}). {err_txt[:300]}", 'error')
+                return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+            mid = None
+            try:
+                msgs = body.get('messages') or []
+                if msgs and isinstance(msgs, list):
+                    mid = (msgs[0] or {}).get('id')
+            except Exception:
+                mid = None
+            if mid:
+                flash(f'Dashboard Excel sent via WhatsApp. id={mid}', 'success')
+            else:
+                frag = str(body)[:300]
+                flash(f'Dashboard Excel sent via WhatsApp. Response: {frag}', 'success')
+        except Exception:
+            flash('Error sending WhatsApp message.', 'error')
     except Exception:
         flash('Error sending WhatsApp message.', 'error')
     return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
@@ -715,6 +789,58 @@ def admin_send_whatsapp_text():
     try:
         msg_url = f'https://graph.facebook.com/v20.0/{phone_id}/messages'
         headers = { 'Authorization': f'Bearer {token}', 'Content-Type': 'application/json' }
+        lower_msg = (message or '').strip().lower()
+        if lower_msg.startswith('template:'):
+            try:
+                try:
+                    parts = (message or '').split(':', 1)[1]
+                except Exception:
+                    parts = ''
+                parts = parts.strip()
+                if ':' in parts:
+                    tname, tlang = parts.split(':', 1)
+                    tname = tname.strip()
+                    tlang = (tlang.strip() or 'en_US')
+                else:
+                    tname = parts or 'hello_world'
+                    tlang = 'en_US'
+                tpl = {
+                    'messaging_product': 'whatsapp',
+                    'to': to_number,
+                    'type': 'template',
+                    'template': {'name': tname, 'language': {'code': tlang}}
+                }
+                tpl_res = requests.post(msg_url, headers=headers, json=tpl, timeout=30)
+                try:
+                    try:
+                        t_body = tpl_res.json() or {}
+                    except Exception:
+                        t_body = {}
+                    if not tpl_res.ok:
+                        try:
+                            t_err = tpl_res.text
+                        except Exception:
+                            t_err = ''
+                        flash(f"Failed to send template '{tname}' (HTTP {tpl_res.status_code}). {t_err[:300]}", 'error')
+                        return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+                    t_mid = None
+                    try:
+                        t_msgs = t_body.get('messages') or []
+                        if t_msgs and isinstance(t_msgs, list):
+                            t_mid = (t_msgs[0] or {}).get('id')
+                    except Exception:
+                        t_mid = None
+                    if t_mid:
+                        flash(f"Template '{tname}' sent. id={t_mid}", 'success')
+                    else:
+                        t_frag = str(t_body)[:300]
+                        flash(f"Template '{tname}' sent. Response: {t_frag}", 'success')
+                except Exception:
+                    flash('Error sending WhatsApp template.', 'error')
+                return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+            except Exception:
+                flash('Error sending WhatsApp template.', 'error')
+                return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
         payload = {
             'messaging_product': 'whatsapp',
             'to': to_number,
@@ -722,14 +848,63 @@ def admin_send_whatsapp_text():
             'text': { 'body': message }
         }
         res = requests.post(msg_url, headers=headers, json=payload, timeout=30)
-        if not res.ok:
+        try:
             try:
-                err_txt = res.text
+                body = res.json() or {}
             except Exception:
-                err_txt = ''
-            flash(f"Failed to send test text (HTTP {res.status_code}). {err_txt[:300]}", 'error')
-            return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
-        flash('Test text sent via WhatsApp.', 'success')
+                body = {}
+            if not res.ok:
+                try:
+                    err_txt = res.text
+                except Exception:
+                    err_txt = ''
+                code_str = ''
+                try:
+                    code_val = (body.get('error') or {}).get('code')
+                    code_str = str(code_val) if code_val is not None else ''
+                except Exception:
+                    code_str = ''
+                should_template = ('470' in err_txt) or (code_str == '470')
+                if should_template:
+                    tpl = {
+                        'messaging_product': 'whatsapp',
+                        'to': to_number,
+                        'type': 'template',
+                        'template': {'name': 'hello_world', 'language': {'code': 'en_US'}}
+                    }
+                    tpl_res = requests.post(msg_url, headers=headers, json=tpl, timeout=30)
+                    if tpl_res.ok:
+                        try:
+                            t_body = tpl_res.json() or {}
+                        except Exception:
+                            t_body = {}
+                        frag = str(t_body)[:300]
+                        flash(f"Template sent to open session. Response: {frag}", 'success')
+                        return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+                    else:
+                        try:
+                            t_err = tpl_res.text
+                        except Exception:
+                            t_err = ''
+                        flash(f"Failed to send template to open session (HTTP {tpl_res.status_code}). {t_err[:300]}", 'error')
+                        return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+                flash(f"Failed to send test text (HTTP {res.status_code}). {err_txt[:300]}", 'error')
+                return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
+            mid = None
+            try:
+                msgs = body.get('messages') or []
+                if msgs and isinstance(msgs, list):
+                    mid = (msgs[0] or {}).get('id')
+            except Exception:
+                mid = None
+            if mid:
+                flash(f'Test text sent via WhatsApp. id={mid}', 'success')
+            else:
+                frag = str(body)[:300]
+                flash(f'Test text sent via WhatsApp. Response: {frag}', 'success')
+        except Exception:
+            flash('Error sending WhatsApp test text.', 'error')
+        return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
     except Exception:
         flash('Error sending WhatsApp test text.', 'error')
     return redirect(url_for('admin_dashboard', year=year, month=month, crm_name=crm, sale_person_name=sp, spg_praneeth=spg, type_of_sale=tos))
