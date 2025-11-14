@@ -853,6 +853,7 @@ def admin_send_whatsapp_text():
                 body = res.json() or {}
             except Exception:
                 body = {}
+            print("DEBUG WHATSAPP RES:", res.status_code, res.text)
             if not res.ok:
                 try:
                     err_txt = res.text
